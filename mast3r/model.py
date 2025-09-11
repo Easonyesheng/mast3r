@@ -1,3 +1,11 @@
+'''
+Author: Easonyesheng preacher@sjtu.edu.cn
+Date: 2025-09-09 16:52:03
+LastEditors: Easonyesheng preacher@sjtu.edu.cn
+LastEditTime: 2025-09-09 17:00:28
+FilePath: /A2PM-MESA/reconer/mast3r/mast3r/model.py
+Description: 
+'''
 # Copyright (C) 2024-present Naver Corporation. All rights reserved.
 # Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
 #
@@ -8,9 +16,11 @@ import torch
 import torch.nn.functional as F
 import os
 
-from mast3r.catmlp_dpt_head import mast3r_head_factory
+import sys
 
-import mast3r.utils.path_to_dust3r  # noqa
+from .catmlp_dpt_head import mast3r_head_factory
+
+# import mast3r.utils.path_to_dust3r  # noqa
 from dust3r.model import AsymmetricCroCo3DStereo  # noqa
 from dust3r.utils.misc import transpose_to_landscape  # noqa
 

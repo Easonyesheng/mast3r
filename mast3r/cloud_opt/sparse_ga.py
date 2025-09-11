@@ -1,3 +1,13 @@
+'''
+Author: EasonZhang
+Date: 2024-08-29 15:36:25
+LastEditors: Easonyesheng preacher@sjtu.edu.cn
+LastEditTime: 2025-09-10 10:52:13
+FilePath: /3DGS/mast3r-main/mast3r/cloud_opt/sparse_ga.py
+Description: TBD
+
+Copyright (c) 2024 by EasonZhang, All Rights Reserved. 
+'''
 # Copyright (C) 2024-present Naver Corporation. All rights reserved.
 # Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
 #
@@ -15,6 +25,9 @@ from collections import namedtuple
 from functools import lru_cache
 from scipy import sparse as sp
 import copy
+
+import sys
+sys.path.append("/opt/data/private/A2PM-git/A2PM-MESA/reconer/mast3r")
 
 from mast3r.utils.misc import mkdir_for, hash_md5
 from mast3r.cloud_opt.utils.losses import gamma_loss
@@ -42,10 +55,13 @@ class SparseGA():
         self.canonical_paths = canonical_paths
         self.img_paths = img_paths
         self.imgs = [fetch_img(img) for img in img_paths]
+        # print('imgs:', self.imgs[0].shape)
         self.intrinsics = res_fine['intrinsics']
         self.cam2w = res_fine['cam2w']
         self.depthmaps = res_fine['depthmaps']
+        # print('depthmaps:', self.depthmaps[0].shape)
         self.pts3d = res_fine['pts3d']
+        # print('pts3d:', self.pts3d[0].shape)
         self.pts3d_colors = []
         self.working_device = self.cam2w.device
         for i in range(len(self.imgs)):
@@ -114,11 +130,12 @@ def convert_dust3r_pairs_naming(imgs, pairs_in):
             pairs_in[pair_id][i]['instance'] = imgs[pairs_in[pair_id][i]['idx']]
     return pairs_in
 
-
+# must understand
 def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc_conf='desc_conf',
                             device='cuda', dtype=torch.float32, shared_intrinsics=False, **kw):
     """ Sparse alignment with MASt3R
         imgs: list of image paths
+        pairs_in: output of dust3r.image_pairs.make_pairs('complete') - dense pairs
         cache_path: path where to dump temporary files (str)
 
         lr1, niter1: learning rate and #iterations for coarse global alignment (3D matching)
@@ -128,17 +145,50 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
     """
     # Convert pair naming convention from dust3r to mast3r
     pairs_in = convert_dust3r_pairs_naming(imgs, pairs_in)
+    # pairs_in: pairs_in[pair_id][0/1]['instance'] = img_path
+
     # forward pass
+    # if kw['rt_matches']:
+    #     pairs, cache_path, corres = forward_mast3r(pairs_in, model,
+    #                                     cache_path=cache_path, subsample=subsample,
+    #                                     desc_conf=desc_conf, device=device, **kw)
+    # else:
     pairs, cache_path = forward_mast3r(pairs_in, model,
-                                       cache_path=cache_path, subsample=subsample,
-                                       desc_conf=desc_conf, device=device)
+                                    cache_path=cache_path, subsample=subsample,
+                                    desc_conf=desc_conf, device=device)
+    # output:
+    """
+    pairs: 
+    {
+        (img1, img2): ((path1, path2), path_corrs)
+    }
+    cache_path: path to cache
+    """
+    
+
 
     # extract canonical pointmaps
     tmp_pairs, pairwise_scores, canonical_views, canonical_paths, preds_21 = \
         prepare_canonical_data(imgs, pairs, subsample, cache_path=cache_path, mode='avg-angle', device=device)
 
+    """ Data structure:
+    tmp_pairs: dict of (img1, img2) -> (X11, C11, X21, C21)
+    pairwise_scores: dict of (img1, img2) -> score
+    canonical_views: dict of img -> (pp, (H, W), focal, core_depth, pixels, idxs, offsets)
+        - pp: principal point
+        - (H, W): image size
+        - focal: focal length
+        - core_depth: subsampled depthmap
+        - pixels: dict of {imgX: (xy1, confs)}, where xy1 is the 2d points of img that matched with imgX
+        - idxs: dict of {imgX: idxs}, where idxs is the index of depth of the anchor points (nearest points with the matched points)
+        - offsets: dict of {imgX: offsets}, where offsets is used to recover the depth of the matched points: depth of matched pixel = core_depthmap[idx] * offset
+    canonical_paths: list of canonical paths
+    preds_21: dict of img, pred_21[img0][img1] = (X, C), X is the 3d points of img1 on img0 coordinate
+
+    """
+
     # compute minimal spanning tree
-    mst = compute_min_spanning_tree(pairwise_scores)
+    mst = compute_min_spanning_tree(pairwise_scores) # seems to be useless
 
     # remove all edges not in the spanning tree?
     # min_spanning_tree = {(imgs[i],imgs[j]) for i,j in mst[1]}
@@ -148,9 +198,22 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
     imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21 = \
         condense_data(imgs, tmp_pairs, canonical_views, preds_21, dtype)
 
+    """ Output of condense_data:
+    imsizes: list of image sizes [(W1, H1), (W2, H2), ...]
+    principal_points/pps: list of principal points [pp1, pp2, ...]
+    focals: list of focal lengths [f1, f2, ...]
+    core_depth: list of subsampled depthmaps [depthmap1, depthmap2, ...]
+    corres: (all_confs, float(all_confs.sum()), imgs_slices)
+    corres2d: list of (img_idx, all_pix1, all_confs, all_confs_sum, [(img2_idx, slice2)])
+    subsamp_preds_21: dict of img, pred_21[img0][img1] = (X, C), X is the 3d points of img1 on img0 coordinate, but only keep the nearest points to the matched points
+    """
+
     imgs, res_coarse, res_fine = sparse_scene_optimizer(
         imgs, subsample, imsizes, pps, base_focals, core_depth, anchors, corres, corres2d, preds_21, canonical_paths, mst,
         shared_intrinsics=shared_intrinsics, cache_path=cache_path, device=device, dtype=dtype, **kw)
+
+    if kw['rt_matches']:
+        return SparseGA(imgs, pairs_in, res_fine or res_coarse, anchors, canonical_paths), corres2d
 
     return SparseGA(imgs, pairs_in, res_fine or res_coarse, anchors, canonical_paths)
 
@@ -166,19 +229,36 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                            shared_intrinsics=False,
                            init={}, device='cuda', dtype=torch.float32,
                            matching_conf_thr=5., loss_dust3r_w=0.01,
-                           verbose=True, dbg=()):
-    init = copy.deepcopy(init)
+                           verbose=True, dbg=(), **kw):
+    """
+    Args:
+        imgs: list of image paths
+        subsample: subsampling factor for the canonical pointmaps: 8
+        imsizes: list of image sizes
+        pps: list of principal points
+        base_focals: list of base focal lengths
+        core_depth: list of subsampled depthmaps
+        anchors: dict of {img_idx_in_imgs: (pixels, depth_idxs, depth_offsets)}
+        corres: (all_confs, float(all_confs.sum()), imgs_slices)
+        corres2d: list of (img_idx, all_pix1, all_confs, all_confs_sum, [(img2_idx, slice2)])
+        subsamp_preds_21: dict of img, pred_21[img0][img1] = (X, C), X is the 3d points of img1 on img0 coordinate, but only keep the nearest points to the matched points
+        canonical_paths: list of canonical paths
+        mst: minimum spanning tree
+            - mst[0]: [i, j] where i is the root and j is the child
+        cache_path: path to cache
+    """
+    init = copy.deepcopy(init) # 
     # extrinsic parameters
     vec0001 = torch.tensor((0, 0, 0, 1), dtype=dtype, device=device)
-    quats = [nn.Parameter(vec0001.clone()) for _ in range(len(imgs))]
-    trans = [nn.Parameter(torch.zeros(3, device=device, dtype=dtype)) for _ in range(len(imgs))]
+    quats = [nn.Parameter(vec0001.clone()) for _ in range(len(imgs))] # quaternion: N x 4
+    trans = [nn.Parameter(torch.zeros(3, device=device, dtype=dtype)) for _ in range(len(imgs))] # translation: N x 3
 
     # intialize
     ones = torch.ones((len(imgs), 1), device=device, dtype=dtype)
-    median_depths = torch.ones(len(imgs), device=device, dtype=dtype)
+    median_depths = torch.ones(len(imgs), device=device, dtype=dtype) # median depth of the scene N x 1
     for img in imgs:
         idx = imgs.index(img)
-        init_values = init.setdefault(img, {})
+        init_values = init.setdefault(img, {}) # get the initial values for the image, each image has a dict of initial values
         if verbose and init_values:
             print(f' >> initializing img=...{img[-25:]} [{idx}] for {set(init_values)}')
 
@@ -211,6 +291,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
     # intrinsics parameters
     if shared_intrinsics:
         # Optimize a single set of intrinsics for all cameras. Use averages as init.
+        # use confidences to weight the intrinsics
         confs = torch.stack([torch.load(pth)[0][2].mean() for pth in canonical_paths]).to(pps)
         weighting = confs / confs.sum()
         pp = nn.Parameter((weighting @ pps).to(dtype))
@@ -260,8 +341,8 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         tmp_cam2w = torch.stack(tmp_cam2w)
 
         # smart reparameterizaton of cameras
-        trans_offset = z_cameras.unsqueeze(1) * torch.cat((imsizes / focals.unsqueeze(1) * (0.5 - pps), ones), dim=-1)
-        new_trans = global_scaling * (tmp_cam2w[:, :3, 3:4] - tmp_cam2w[:, :3, :3] @ trans_offset.unsqueeze(-1))
+        trans_offset = z_cameras.unsqueeze(1) * torch.cat((imsizes / focals.unsqueeze(1) * (0.5 - pps), ones), dim=-1) # N x 3
+        new_trans = global_scaling * (tmp_cam2w[:, :3, 3:4] - tmp_cam2w[:, :3, :3] @ trans_offset.unsqueeze(-1)) # t = t - R * t_offset
         cam2w = torch.cat((torch.cat((tmp_cam2w[:, :3, :3], new_trans), dim=2),
                           vec0001.view(1, 1, 4).expand(len(K), 1, 4)), dim=1)
 
@@ -292,14 +373,15 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
     # spectral low-rank projection of depthmaps
     if lora_depth:
         core_depth, lora_depth_proj = spectral_projection_of_depthmaps(
-            imgs, K, core_depth, subsample, cache_path=cache_path, **lora_depth)
+            imgs, K, core_depth, subsample, cache_path=cache_path, **lora_depth) # TODO: not understand, what is lora_depth
+
     if exp_depth:
         core_depth = [d.clip(min=1e-4).log() for d in core_depth]
     core_depth = [nn.Parameter(d.ravel().to(dtype)) for d in core_depth]
     log_sizes = [nn.Parameter(torch.zeros(1, dtype=dtype, device=device)) for _ in range(len(imgs))]
 
     # Fetch img slices
-    _, confs_sum, imgs_slices = corres
+    _, confs_sum, imgs_slices = corres # slice is a image slice, including multiple image pairs
 
     # Define which pairs are fine to use with matching
     def matching_check(x): return x.max() > matching_conf_thr
@@ -308,10 +390,10 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         is_matching_ok[s.img1, s.img2] = matching_check(s.confs)
 
     # Prepare slices and corres for losses
-    dust3r_slices = [s for s in imgs_slices if not is_matching_ok[s.img1, s.img2]]
-    loss3d_slices = [s for s in imgs_slices if is_matching_ok[s.img1, s.img2]]
+    dust3r_slices = [s for s in imgs_slices if not is_matching_ok[s.img1, s.img2]] # dust3r_slices are the slices that are not matching
+    loss3d_slices = [s for s in imgs_slices if is_matching_ok[s.img1, s.img2]] # loss3d_slices are the slices that are matching
     cleaned_corres2d = []
-    for cci, (img1, pix1, confs, confsum, imgs_slices) in enumerate(corres2d):
+    for cci, (img1, pix1, confs, confsum, imgs_slices) in enumerate(corres2d): # imgs_slices are the slices that are matching: (img_src, matched_imgs)
         cf_sum = 0
         pix1_filtered = []
         confs_filtered = []
@@ -341,7 +423,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
             tgt_pts, tgt_confs = preds_21[imgs[s.img2]][imgs[s.img1]]
             tgt_pts = geotrf(cam2w[s.img2], tgt_pts)
             cf_sum += tgt_confs.sum()
-            loss += tgt_confs @ pix_loss(pts3d[s.img1], tgt_pts)
+            loss += tgt_confs @ pix_loss(pts3d[s.img1], tgt_pts) # 
         return loss / cf_sum if cf_sum != 0. else 0.
 
     def loss_3d(K, w2cam, pts3d, pix_loss):
@@ -390,6 +472,9 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
         return loss / npix if npix != 0 else 0.
 
+    """
+    Optimize BA using Adam
+    """
     def optimize_loop(loss_func, lr_base, niter, pix_loss, lr_end=0):
         # create optimizer
         params = pps + log_focals + quats + trans + log_sizes + core_depth
@@ -512,7 +597,7 @@ def make_dense_pts3d(intrinsics, cam2w, depthmaps, canonical_paths, subsample, d
         H, W = conf.shape
         pixels = torch.from_numpy(np.mgrid[:W, :H].T.reshape(-1, 2)).float().to(device)
         idxs, offsets = anchor_depth_offsets(canon2, {i: (pixels, None)}, subsample=subsample)
-        anchors[i] = (pixels, idxs[i], offsets[i])
+        anchors[i] = (pixels, idxs[i], offsets[i]) # use this to achieve the depth of the matched points: depth of pixel = depthmap[pixel] * offset
 
     # densify sparse depthmaps
     pts3d, depthmaps_out = make_pts3d(anchors, intrinsics, cam2w, [
@@ -524,9 +609,15 @@ def make_dense_pts3d(intrinsics, cam2w, depthmaps, canonical_paths, subsample, d
 @torch.no_grad()
 def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
                    device='cuda', subsample=8, **matching_kw):
+    """
+    Returns:
+        - res_paths: dict of (path1, path2), path_corres
+    """
     res_paths = {}
+    corres_list = []
 
     for img1, img2 in tqdm(pairs):
+        print(img1['true_shape'])
         idx1 = hash_md5(img1['instance'])
         idx2 = hash_md5(img2['instance'])
 
@@ -549,11 +640,12 @@ def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
             qonfs = [r[desc_conf][0] for r in res]
 
             # save
-            torch.save(to_cpu((X11, C11, X21, C21)), mkdir_for(path1))
+            torch.save(to_cpu((X11, C11, X21, C21)), mkdir_for(path1)) # path1 is the path to save the results of the first image
             torch.save(to_cpu((X22, C22, X12, C12)), mkdir_for(path2))
 
             # perform reciprocal matching
             corres = extract_correspondences(descs, qonfs, device=device, subsample=subsample)
+            # corres_list.append(corres)
 
             conf_score = (C11.mean() * C12.mean() * C21.mean() * C22.mean()).sqrt().sqrt()
             matching_score = (float(conf_score), float(corres[2].sum()), len(corres[2]))
@@ -561,11 +653,24 @@ def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
                 torch.save((matching_score, corres), mkdir_for(path_corres))
 
         res_paths[img1['instance'], img2['instance']] = (path1, path2), path_corres
+        # res_paths = {
+        #   (img1, img2): ((path1, path2), path_corres) # pair info
+        # }
 
     del model
     torch.cuda.empty_cache()
 
+    # if matching_kw.get('rt_matches'):
+    #     return res_paths, cache_path, corres_list
+
     return res_paths, cache_path
+    """
+    res_paths are 
+    {
+        (img1, img2): ((path1, path2), path_corres) # pair-level info
+    }
+    saved in local path to avoid recomputation
+    """
 
 
 def symmetric_inference(model, img1, img2, device):
@@ -580,8 +685,16 @@ def symmetric_inference(model, img1, img2, device):
     def decoder(feat1, feat2, pos1, pos2, shape1, shape2):
         dec1, dec2 = model._decoder(feat1, pos1, feat2, pos2)
         with torch.cuda.amp.autocast(enabled=False):
-            res1 = model._downstream_head(1, [tok.float() for tok in dec1], shape1)
+            res1 = model._downstream_head(1, [tok.float() for tok in dec1], shape1) # 1 means using the model.downstream_head1 see super._downstream_head
             res2 = model._downstream_head(2, [tok.float() for tok in dec2], shape2)
+            """
+            res = {
+                pts3d: tensor(B,H,W,3),
+                conf: tensor(B,H,W),
+                desc: tensor(B,H,W,D),
+                desc_conf: tensor(B,H,W) or None,
+            }
+            """
         return res1, res2
 
     # decoder 1-2
@@ -633,8 +746,30 @@ def extract_correspondences(feats, qonfs, subsample=8, device=None, ptmap_key='p
 @torch.no_grad()
 def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_conf_thr=0,
                            cache_path=None, device='cuda', **kw):
+    """TODO: understand the function
+    Args:
+        imgs: list of image paths
+        tmp_pairs: {
+            (img1, img2): ((path1, path2), path_corres) # pair-level info
+            ...
+        }
+        subsample: subsampling factor for the canonical pointmaps: 8
+    Returns:
+        - tmp_pairs: dict of (img1, img2), ((path1, path2), path_corres)
+        - pairwise_scores: N x N distance matrix
+        - canonical_views: dict of {img: (pp, (H, W), focal, core_depth, pixels, idxs, offsets)}
+            - pp: principal point (W/2, H/2)
+            - H, W: image size
+            - focal: focal length 
+            - core_depth: subsampled depthmap
+            - pixels: dict of {imgX: (xy1, confs)}, where xy1 is the 2d points of img that matched with imgX
+            - idxs: dict of {imgX: idxs}, where idxs is the index of depth of the anchor points (nearest points with the matched points)
+            - offsets: dict of {imgX: offsets}, where offsets is used to recover the depth of the matched points: depth of matched pixel = core_depthmap[idx] * offset
+        - canonical_paths: list of cache paths
+        - preds_21: dict of img, pred_21[img0][img1] = (X, C), X is the 3d points of img1 on img0 coordinate
+    """
     canonical_views = {}
-    pairwise_scores = torch.zeros((len(imgs), len(imgs)), device=device)
+    pairwise_scores = torch.zeros((len(imgs), len(imgs)), device=device) # N x N distance matrix
     canonical_paths = []
     preds_21 = {}
 
@@ -648,22 +783,23 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
             # cache does not exist yet, we create it!
             canon = focal = None
 
-        # collect all pred1
+        # 
         n_pairs = sum((img in pair) for pair in tmp_pairs)
 
         ptmaps11 = None
         pixels = {}
         n = 0
-        for (img1, img2), ((path1, path2), path_corres) in tmp_pairs.items():
+        for (img1, img2), ((path1, path2), path_corres) in tmp_pairs.items(): # key + value
             score = None
             if img == img1:
-                X, C, X2, C2 = torch.load(path1, map_location=device)
+                X, C, X2, C2 = torch.load(path1, map_location=device) # 3d points and confidence
                 score, (xy1, xy2, confs) = load_corres(path_corres, device, min_conf_thr)
                 pixels[img2] = xy1, confs
                 if img not in preds_21:
                     preds_21[img] = {}
                 # Subsample preds_21
-                preds_21[img][img2] = X2[::subsample, ::subsample].reshape(-1, 3), C2[::subsample, ::subsample].ravel()
+                preds_21[img][img2] = X2[::subsample, ::subsample].reshape(-1, 3), C2[::subsample, ::subsample].ravel() # N x 3, N
+                # save the 3d points and confidence of img2 on the img coordinate
 
             if img == img2:
                 X, C, X2, C2 = torch.load(path2, map_location=device)
@@ -673,7 +809,7 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
                     preds_21[img] = {}
                 preds_21[img][img1] = X2[::subsample, ::subsample].reshape(-1, 3), C2[::subsample, ::subsample].ravel()
 
-            if score is not None:
+            if score is not None: # for each pair
                 i, j = imgs.index(img1), imgs.index(img2)
                 # score = score[0]
                 # score = np.log1p(score[2])
@@ -688,7 +824,7 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
                     ptmaps11 = torch.empty((n_pairs, H, W, 3), device=device)
                     confs11 = torch.empty((n_pairs, H, W), device=device)
 
-                ptmaps11[n] = X
+                ptmaps11[n] = X # img coordinate 3d points
                 confs11[n] = C
                 n += 1
 
@@ -696,6 +832,16 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
             canon, canon2, cconf = canonical_view(ptmaps11, confs11, subsample, **kw)
             del ptmaps11
             del confs11
+
+        """
+        preds_21[img0][img1] = (X, C), X is the 3d points of img1 on img0 coordinate
+        canon: 3d points of img0 on img0 coordinate
+        canon2: depth of img0 on img0 coordinate
+        cconf: confidence of img0 on img0 coordinate
+        pixels = {
+            imgX: (xy1, confs), xy1 is the 2d points of img that matched with imgX
+        }
+        """
 
         # compute focals
         H, W = canon.shape[:2]
@@ -723,19 +869,34 @@ def load_corres(path_corres, device, min_conf_thr):
 
 
 PairOfSlices = namedtuple(
-    'ImgPair', 'img1, slice1, pix1, anchor_idxs1, img2, slice2, pix2, anchor_idxs2, confs, confs_sum')
+    'ImgPair', 'img1, slice1, pix1, anchor_idxs1, img2, slice2, pix2, anchor_idxs2, confs, confs_sum') # namedtuple is a subclass of tuple, with named fields
+
 
 
 def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float32):
+    """
+    Args:
+        imgs: list of image paths
+        tmp_paths: list of (img1, img2)
+        canonical_views: dict of {img: (pp, (H, W), focal, core_depth, pixels, idxs, offsets)}
+            - pp: principal point
+            - (H, W): image size
+            - focal: focal length
+            - core_depth: subsampled depthmap - anchors 
+            - pixels: dict of {imgX: (xy1, confs)}, where xy1 is the 2d points of img that matched with imgX
+            - idxs: dict of {imgX: idxs}, where idxs is the index of depth of the anchor points (nearest points with the matched points)
+            - offsets: dict of {imgX: offsets}, where offsets is used to recover the depth of the matched points: depth of matched pixel = core_depthmap[idx] * offset
+        preds_21: dict of img, pred_21[img0][img1] = (X, C), X is the 3d points of img1 on img0 coordinate
+    """
     # aggregate all data properly
     set_imgs = set(imgs)
 
-    principal_points = []
-    shapes = []
-    focals = []
-    core_depth = []
-    img_anchors = {}
-    tmp_pixels = {}
+    principal_points = [] # list of principal points [pp1, pp2, ...]
+    shapes = [] # list of image shapes [(H1, W1), (H2, W2), ...]
+    focals = [] # list of focal lengths [f1, f2, ...]
+    core_depth = [] # list of subsampled depthmaps [depthmap1, depthmap2, ...]
+    img_anchors = {} # dict of {img_idx_in_imgs: (pixels, depth_idxs, depth_offsets)}
+    tmp_pixels = {} # dict of {(img1_path, img2_path): (pixels, match_confs, slice)}
 
     for idx1, img1 in enumerate(imgs):
         # load stuff
@@ -754,14 +915,17 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
         for img2, (pixels, match_confs) in pixels_confs.items():
             if img2 not in set_imgs:
                 continue
-            assert len(pixels) == len(idxs[img2]) == len(offsets[img2])
-            img_uv1.append(torch.cat((pixels, torch.ones_like(pixels[:, :1])), dim=-1))
-            img_idxs.append(idxs[img2])
-            img_offs.append(offsets[img2])
+            assert len(pixels) == len(idxs[img2]) == len(offsets[img2]) # use idx and offset to recover the depth of the matched points
+            img_uv1.append(torch.cat((pixels, torch.ones_like(pixels[:, :1])), dim=-1)) # img_uv1 is the 2d points in the image1
+            img_idxs.append(idxs[img2]) # idxs is the index of the uv corresponding to the 3d points
+            img_offs.append(offsets[img2]) # 
             cur_n.append(cur_n[-1] + len(pixels))
             # store the position of 3d points
             tmp_pixels[img1, img2] = pixels.to(dtype), match_confs.to(dtype), slice(*cur_n[-2:])
+            # slice is the position of the 3d points in the concatenated 3d points
         img_anchors[idx1] = (torch.cat(img_uv1), torch.cat(img_idxs), torch.cat(img_offs))
+        # dictionary of {img_idx: (pixels, depth_idxs, depth_offsets)}
+        # depth idxs are used to map to the anchor points that is the nearest points to the matched points
 
     all_confs = []
     imgs_slices = []
@@ -769,21 +933,23 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
 
     for img1, img2 in tmp_paths:
         try:
-            pix1, confs1, slice1 = tmp_pixels[img1, img2]
+            pix1, confs1, slice1 = tmp_pixels[img1, img2] # matched points in img1 with confidence and 3D points slice
             pix2, confs2, slice2 = tmp_pixels[img2, img1]
         except KeyError:
             continue
-        img1 = imgs.index(img1)
+        img1 = imgs.index(img1) # get the index of the image in the list of images
         img2 = imgs.index(img2)
-        confs = (confs1 * confs2).sqrt()
+        confs = (confs1 * confs2).sqrt() # confidence is the product of the two confidences
 
         # prepare for loss_3d
         all_confs.append(confs)
-        anchor_idxs1 = canonical_views[imgs[img1]][5][imgs[img2]]
+        anchor_idxs1 = canonical_views[imgs[img1]][5][imgs[img2]] # '5' is the index of idxs
         anchor_idxs2 = canonical_views[imgs[img2]][5][imgs[img1]]
         imgs_slices.append(PairOfSlices(img1, slice1, pix1, anchor_idxs1,
                                         img2, slice2, pix2, anchor_idxs2,
-                                        confs, float(confs.sum())))
+                                        confs, float(confs.sum()))) # without offset is for what?
+                                        # img_slices is a namedtuple
+                                        # it contains the a pair of (image_index, slice, 2d points, anchor index) and the confidence of the pair, confidence sum
 
         # prepare for loss_2d
         corres2d[img1].append((pix1, confs, img2, slice2))
@@ -793,11 +959,15 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
     corres = (all_confs, float(all_confs.sum()), imgs_slices)
 
     def aggreg_matches(img1, list_matches):
+        """ Aggregates the matches all together for a single image
+        """
         pix1, confs, img2, slice2 = zip(*list_matches)
         all_pix1 = torch.cat(pix1).to(dtype)
         all_confs = torch.cat(confs).to(dtype)
         return img1, all_pix1, all_confs, float(all_confs.sum()), [(j, sl2) for j, sl2 in zip(img2, slice2)]
-    corres2d = [aggreg_matches(img, m) for img, m in corres2d.items()]
+    corres2d = [aggreg_matches(img, m) for img, m in corres2d.items()] # list of (img_idx, all_pix1, all_confs, all_confs_sum, [(img2_idx, slice2)])
+    # all_pix1 are a tensor of all 2d points in the image1 matched to other images
+    # the specific img2 and slice2 are stored in the list of tuples (img2_idx, slice2)
 
     imsizes = torch.tensor([(W, H) for H, W in shapes], device=pp.device)  # (W,H)
     principal_points = torch.stack(principal_points)
@@ -805,34 +975,56 @@ def condense_data(imgs, tmp_paths, canonical_views, preds_21, dtype=torch.float3
 
     # Subsample preds_21
     subsamp_preds_21 = {}
-    for imk, imv in preds_21.items():
+    for imk, imv in preds_21.items(): # imgv is a dict of {img2: (X, C)}
         subsamp_preds_21[imk] = {}
         for im2k, (pred, conf) in preds_21[imk].items():
             idxs = img_anchors[imgs.index(im2k)][1]
-            subsamp_preds_21[imk][im2k] = (pred[idxs], conf[idxs])  # anchors subsample
+            subsamp_preds_21[imk][im2k] = (pred[idxs], conf[idxs])  # anchors subsample, only save the nearest points to the matched points
+    
+    # what is preds_21: 3d points and confidences, which are subsampled by anchors, having the corresponding image index
 
     return imsizes, principal_points, focals, core_depth, img_anchors, corres, corres2d, subsamp_preds_21
 
+    """ Output:
+    imsizes: list of image sizes [(W1, H1), (W2, H2), ...]
+    principal_points: list of principal points [pp1, pp2, ...]
+    focals: list of focal lengths [f1, f2, ...]
+    core_depth: list of subsampled depthmaps [depthmap1, depthmap2, ...]
+    img_anchors: dict of {img_idx_in_imgs: (pixels, depth_idxs, depth_offsets)}
+    corres: (all_confs, float(all_confs.sum()), imgs_slices)
+    corres2d: list of (img_idx, all_pix1, all_confs, all_confs_sum, [(img2_idx, slice2)])
+    subsamp_preds_21: dict of img, pred_21[img0][img1] = (X, C), X is the 3d points of img1 on img0 coordinate, but only keep the nearest points to the matched points
+    """
+
 
 def canonical_view(ptmaps11, confs11, subsample, mode='avg-angle'):
+    """
+    Args:
+        ptmaps11: 3d points of image1 on image1 coordinate, shape: N x H x W x 3, comes from various pairs
+    Returns:
+        canon: canonical pointmap shape: H x W x 3
+        canon2: confidence-weighted average of the relative depth H x W
+        confs: confidence of the canonical point map, shape: H x W
+    """
     assert len(ptmaps11) == len(confs11) > 0, 'not a single view1 for img={i}'
 
     # canonical pointmap is just a weighted average
-    confs11 = confs11.unsqueeze(-1) - 0.999
-    canon = (confs11 * ptmaps11).sum(0) / confs11.sum(0)
+    confs11 = confs11.unsqueeze(-1) - 0.999 # N x H x W x 1
+    canon = (confs11 * ptmaps11).sum(0) / confs11.sum(0) # H x W x 3
 
-    canon_depth = ptmaps11[..., 2].unsqueeze(1)
+    canon_depth = ptmaps11[..., 2].unsqueeze(1) # shape: N x 1 x H x W
     S = slice(subsample // 2, None, subsample)
-    center_depth = canon_depth[:, :, S, S]
-    center_depth = torch.clip(center_depth, min=torch.finfo(center_depth.dtype).eps)
+    center_depth = canon_depth[:, :, S, S] # N x 1 x H // 8 x W // 8
+    center_depth = torch.clip(center_depth, min=torch.finfo(center_depth.dtype).eps) # clip the depth to avoid division by zero
 
-    stacked_depth = F.pixel_unshuffle(canon_depth, subsample)
-    stacked_confs = F.pixel_unshuffle(confs11[:, None, :, :, 0], subsample)
+    stacked_depth = F.pixel_unshuffle(canon_depth, subsample) # N x 64 x H // 8 x W // 8
+    stacked_confs = F.pixel_unshuffle(confs11[:, None, :, :, 0], subsample) # N x 64 x H // 8 x W // 8
 
     if mode == 'avg-reldepth':
-        rel_depth = stacked_depth / center_depth
-        stacked_canon = (stacked_confs * rel_depth).sum(dim=0) / stacked_confs.sum(dim=0)
-        canon2 = F.pixel_shuffle(stacked_canon.unsqueeze(0), subsample).squeeze()
+        rel_depth = stacked_depth / center_depth # N x 64 x H // 8 x W // 8, each 8x8 area's depth is relative to the center depth
+        stacked_canon = (stacked_confs * rel_depth).sum(dim=0) / stacked_confs.sum(dim=0) # 64 x H // 8 x W // 8, confidences weighted by relative depth
+        canon2 = F.pixel_shuffle(stacked_canon.unsqueeze(0), subsample).squeeze() # shape is H x W
+        # pixel_shuffle is the inverse operation of pixel_unshuffle, it is used to upsample the image
 
     elif mode == 'avg-angle':
         xy = ptmaps11[..., 0:2].permute(0, 3, 1, 2)
@@ -851,19 +1043,28 @@ def canonical_view(ptmaps11, confs11, subsample, mode='avg-angle'):
     else:
         raise ValueError(f'bad {mode=}')
 
-    confs = (confs11.square().sum(dim=0) / confs11.sum(dim=0)).squeeze()
+    confs = (confs11.square().sum(dim=0) / confs11.sum(dim=0)).squeeze() # H x W
     return canon, canon2, confs
 
 
 def anchor_depth_offsets(canon_depth, pixels, subsample=8):
+    """ anchor is the subsampled grid points
+    Args:
+        canon_depth: canonical depth map, shape: H x W
+        pixels: dict of (imgX, (xy1, confs)), xy1 is the 2d points of img matched with imgX 
+    Returns:
+        core_idxs: {img2: core_idx}, core_idx is the index of the anchor of depth
+        core_offs: {img2: offset}, offset is the pts_z / ref_z
+    """
     device = canon_depth.device
 
     # create a 2D grid of anchor 3D points
     H1, W1 = canon_depth.shape
+    # print(f'Creating {H1}x{W1} anchors')
     yx = np.mgrid[subsample // 2:H1:subsample, subsample // 2:W1:subsample]
     H2, W2 = yx.shape[1:]
-    cy, cx = yx.reshape(2, -1)
-    core_depth = canon_depth[cy, cx]
+    cy, cx = yx.reshape(2, -1) # shape: 2 x N
+    core_depth = canon_depth[cy, cx] # subsampled depth shape is N = H2 x W2 
     assert (core_depth > 0).all()
 
     # slave 3d points (attached to core 3d points)
@@ -874,7 +1075,7 @@ def anchor_depth_offsets(canon_depth, pixels, subsample=8):
         px, py = xy1.long().T
 
         # find nearest anchor == block quantization
-        core_idx = (py // subsample) * W2 + (px // subsample)
+        core_idx = (py // subsample) * W2 + (px // subsample) # the index of the anchor of depth
         core_idxs[img2] = core_idx.to(device)
 
         # compute relative depth offsets w.r.t. anchors
@@ -882,6 +1083,7 @@ def anchor_depth_offsets(canon_depth, pixels, subsample=8):
         pts_z = canon_depth[py, px]
         offset = pts_z / ref_z
         core_offs[img2] = offset.detach().to(device)
+        # offset is pts_z / ref_z, pts_z is the depth of the matched points, ref_z is the depth of the anchor (nearest point)
 
     return core_idxs, core_offs
 
@@ -911,10 +1113,11 @@ def sim_func(p1, p2, gamma):
 
 def backproj(K, depthmap, subsample):
     H, W = depthmap.shape
-    uv = np.mgrid[subsample // 2:subsample * W:subsample, subsample // 2:subsample * H:subsample].T.reshape(H, W, 2)
-    xyz = depthmap.unsqueeze(-1) * geotrf(inv(K), todevice(uv, K.device), ncol=3)
-    return xyz
+    # the 2D grid of pixel coordinates, from subsample // 2 to subsample * W, subsample // 2 to subsample * H
+    uv = np.mgrid[subsample // 2:subsample * W:subsample, subsample // 2:subsample * H:subsample].T.reshape(H, W, 2) # 2D grid of pixel coordinates
 
+    xyz = depthmap.unsqueeze(-1) * geotrf(inv(K), todevice(uv, K.device), ncol=3)
+    return xyz # the 3d points in camera coordinates: 
 
 def spectral_projection_depth(K, depthmap, subsample, k=64, cache_path='',
                               normalized_cuts=True, gamma=7, min_norm=5):

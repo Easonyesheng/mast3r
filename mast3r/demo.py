@@ -16,8 +16,8 @@ from scipy.spatial.transform import Rotation
 import tempfile
 import shutil
 
-from mast3r.cloud_opt.sparse_ga import sparse_global_alignment
-from mast3r.cloud_opt.tsdf_optimizer import TSDFPostProcess
+from .cloud_opt.sparse_ga import sparse_global_alignment
+from .cloud_opt.tsdf_optimizer import TSDFPostProcess
 
 import mast3r.utils.path_to_dust3r  # noqa
 from dust3r.image_pairs import make_pairs
@@ -135,7 +135,9 @@ def get_3D_model_from_scene(silent, scene_state, min_conf_thr=2, as_pointcloud=F
     return _convert_scene_output_to_glb(outfile, rgbimg, pts3d, msk, focals, cams2world, as_pointcloud=as_pointcloud,
                                         transparent_cams=transparent_cams, cam_size=cam_size, silent=silent)
 
-
+"""
+Main function to run the demo
+"""
 def get_reconstructed_scene(outdir, gradio_delete_cache, model, device, silent, image_size, current_scene_state,
                             filelist, optim_level, lr1, niter1, lr2, niter2, min_conf_thr, matching_conf_thr,
                             as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size, scenegraph_type, winsize,
@@ -170,10 +172,24 @@ def get_reconstructed_scene(outdir, gradio_delete_cache, model, device, silent, 
         cache_dir = tempfile.mkdtemp(suffix='_cache', dir=outdir)
     else:
         cache_dir = os.path.join(outdir, 'cache')
-    scene = sparse_global_alignment(filelist, pairs, cache_dir,
-                                    model, lr1=lr1, niter1=niter1, lr2=lr2, niter2=niter2, device=device,
-                                    opt_depth='depth' in optim_level, shared_intrinsics=shared_intrinsics,
-                                    matching_conf_thr=matching_conf_thr, **kw)
+    
+    # scene is the most important object here
+    if kw['rt_matches']:
+        scene, corrs = sparse_global_alignment(filelist, pairs, cache_dir,
+                                        model, lr1=lr1, niter1=niter1, lr2=lr2, niter2=niter2, device=device,
+                                        opt_depth='depth' in optim_level, shared_intrinsics=shared_intrinsics,
+                                        matching_conf_thr=matching_conf_thr, **kw)
+    else:
+        scene = sparse_global_alignment(filelist, pairs, cache_dir,
+                                        model, lr1=lr1, niter1=niter1, lr2=lr2, niter2=niter2, device=device,
+                                        opt_depth='depth' in optim_level, shared_intrinsics=shared_intrinsics,
+                                        matching_conf_thr=matching_conf_thr, **kw)
+    
+
+    if kw['rt_scene']:
+        return scene, corrs
+
+    
     if current_scene_state is not None and \
         not current_scene_state.should_delete and \
             current_scene_state.outfile_name is not None:
@@ -181,11 +197,12 @@ def get_reconstructed_scene(outdir, gradio_delete_cache, model, device, silent, 
     else:
         outfile_name = tempfile.mktemp(suffix='_scene.glb', dir=outdir)
 
-    scene_state = SparseGAState(scene, gradio_delete_cache, cache_dir, outfile_name)
+    scene_state = SparseGAState(scene, gradio_delete_cache, cache_dir, outfile_name) # core is the SparseGA object
     outfile = get_3D_model_from_scene(silent, scene_state, min_conf_thr, as_pointcloud, mask_sky,
                                       clean_depth, transparent_cams, cam_size, TSDF_thresh)
+    
+    
     return scene_state, outfile
-
 
 def set_scenegraph_options(inputfiles, win_cyclic, refid, scenegraph_type):
     num_files = len(inputfiles) if inputfiles is not None else 1
