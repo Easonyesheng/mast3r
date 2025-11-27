@@ -2,7 +2,7 @@
 Author: EasonZhang
 Date: 2024-08-29 15:36:25
 LastEditors: Easonyesheng preacher@sjtu.edu.cn
-LastEditTime: 2025-09-10 10:52:13
+LastEditTime: 2025-11-27 11:37:30
 FilePath: /3DGS/mast3r-main/mast3r/cloud_opt/sparse_ga.py
 Description: TBD
 
@@ -26,8 +26,7 @@ from functools import lru_cache
 from scipy import sparse as sp
 import copy
 
-import sys
-sys.path.append("/opt/data/private/A2PM-git/A2PM-MESA/reconer/mast3r")
+
 
 from mast3r.utils.misc import mkdir_for, hash_md5
 from mast3r.cloud_opt.utils.losses import gamma_loss
